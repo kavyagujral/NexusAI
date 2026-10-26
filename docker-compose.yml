@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. PostgreSQL (Relational Metadata: Videos, Jobs, Pipeline Tracking)
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexus_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexus_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus_secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-nexus_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexus_admin} -d ${POSTGRES_DB:-nexus_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus_network
+
+  # ----------------------------------------------------------------------------
+  # 2. FastAPI Backend & Multimodal ML Pipeline Engine (ChromaDB + PyTorch + Whisper)
+  # ----------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: nexus_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - APP_NAME=Nexus Spatiotemporal RAG Engine
+      - APP_ENV=production
+      - DEBUG=False
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-nexus_admin}:${POSTGRES_PASSWORD:-nexus_secure_password}@postgres:5432/${POSTGRES_DB:-nexus_db}
+      - CHROMA_PERSIST_DIR=./data/chromadb
+      - CHROMA_COLLECTION_NAME=nexus_spatiotemporal_chunks
+      - STORAGE_DIR=./data
+      - VIDEOS_DIR=./data/videos
+      - FRAMES_DIR=./data/frames
+      - AUDIO_DIR=./data/audio
+      - DEVICE=cpu
+      - WHISPER_MODEL=base
+      - VISION_MODEL_BACKBONE=resnet50
+      - TEXT_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      - ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173,http://localhost:80
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - nexus_network
+
+  # ----------------------------------------------------------------------------
+  # 3. React + TypeScript + Tailwind CSS Frontend Dashboard
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: nexus_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+    networks:
+      - nexus_network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  nexus_network:
+    driver: bridge

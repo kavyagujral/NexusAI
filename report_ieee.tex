@@ -1,0 +1,310 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{microtype}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\setlength{\parskip}{0pt}
+\setlength{\floatsep}{4pt}
+\setlength{\textfloatsep}{4pt}
+\setlength{\intextsep}{4pt}
+\setlength{\abovecaptionskip}{2pt}
+\setlength{\belowcaptionskip}{0pt}
+
+\begin{document}
+
+\title{Nexus: A Multimodal Spatiotemporal Retrieval-Augmented\\
+Generation Engine for Educational Video Understanding}
+
+\author{
+    \IEEEauthorblockN{Kavya Gujral}
+    \IEEEauthorblockA{
+        \textit{Department of Computer Science and Engineering}\\
+        \textit{[University Name]} \quad [email@university.edu]
+    }
+}
+
+\maketitle
+
+% ── Abstract ──────────────────────────────────────────────────────────────────
+\begin{abstract}
+Recorded lectures are notoriously hard to search. You can ctrl+F a PDF, but
+you cannot ctrl+F a video. \textbf{Nexus} is our attempt to fix that: a
+multimodal RAG engine that lets students ask natural language questions about
+educational recordings and get back exact timestamps, frame screenshots, and
+synthesised answers. Under the hood, the system fuses speech (OpenAI Whisper
+plus a PyTorch GRU for sequential context), vision (a pretrained ResNet-50
+CNN), and temporal position (sinusoidal encodings) into 512-dimensional
+vectors --- all joined through a single-head cross-modal attention mechanism
+written from scratch in NumPy, without any deep learning framework. These
+vectors live in a ChromaDB store, and queries come in as plain English.
+\end{abstract}
+
+\begin{IEEEkeywords}
+RAG, multimodal learning, cross-modal attention, spatiotemporal grounding,
+ChromaDB, Whisper, ResNet-50, GRU, educational video retrieval
+\end{IEEEkeywords}
+
+% ── 1. Introduction ───────────────────────────────────────────────────────────
+\section{Introduction}
+
+Consider a two-hour Zoom recording of a software architecture lecture. A
+student trying to revisit the part about microservice communication has,
+realistically, two options: scrub through the video manually, or hope the
+transcript search surfaces the right segment. Neither works well. Transcript
+search ignores what was \emph{on screen} --- and in technical lectures, the
+slide or diagram often carries more information than the narration.
+
+Nexus was built around a specific intuition: a lecture moment is only fully
+described by three things together --- what was \emph{said}, what was
+\emph{shown}, and \emph{when} it happened. Strip any of those out and you
+lose fidelity. So rather than building yet another transcript search tool,
+we encode all three into a joint embedding and let cosine similarity do the
+heavy lifting.
+
+The contributions are four-fold. First, a pure-NumPy single-head cross-modal
+attention (CLO01/CLO02) --- no PyTorch, no autograd, every matrix multiply
+visible and testable. Second, a two-second window alignment scheme that
+handles the messy reality of Whisper segments that don't align neatly to
+frame boundaries. Third, an eight-stage asynchronous ML pipeline served
+through FastAPI with real-time frontend progress reporting. And fourth, a
+dual-database design that separates relational metadata (PostgreSQL) from
+vector search (ChromaDB).
+
+% ── 2. System Architecture ────────────────────────────────────────────────────
+\section{System Architecture}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    box/.style={rectangle, draw, rounded corners=2pt, minimum width=2.55cm,
+                minimum height=0.42cm, font=\scriptsize, fill=blue!8, align=center},
+    sbox/.style={rectangle, draw, rounded corners=2pt, minimum width=1.2cm,
+                minimum height=0.42cm, font=\scriptsize, fill=green!8, align=center},
+    arrow/.style={->, >=stealth, thin},
+    node distance=0.55cm
+]
+\node[box] (vid)    {Input Video};
+\node[box, below left=0.45cm and 0.3cm of vid]  (fr)  {OpenCV Frames\\$\Delta t{=}2$\,s};
+\node[box, below right=0.45cm and 0.3cm of vid] (au)  {FFmpeg Audio\\16\,kHz};
+\node[box, below=0.45cm of fr]  (rn)  {ResNet-50 CNN\\512-dim};
+\node[box, below=0.45cm of au]  (wh)  {Whisper STT\\+ GRU};
+\node[box, below=0.9cm of vid]  (al)  {2\,s Window Alignment};
+\node[box, below=0.45cm of al]  (at)  {NumPy Cross-Modal Attn};
+\node[box, below=0.45cm of at]  (ch)  {ChromaDB 512-dim};
+\node[sbox, below left=0.45cm and 0.5cm of ch]  (q)  {NL Query};
+\node[sbox, below right=0.45cm and 0.5cm of ch] (r)  {Answer +\\Timestamp};
+
+\draw[arrow] (vid) -- (fr);
+\draw[arrow] (vid) -- (au);
+\draw[arrow] (fr)  -- (rn);
+\draw[arrow] (au)  -- (wh);
+\draw[arrow] (rn)  -- (al);
+\draw[arrow] (wh)  -- (al);
+\draw[arrow] (al)  -- (at);
+\draw[arrow] (at)  -- (ch);
+\draw[arrow] (q)   -- (ch);
+\draw[arrow] (ch)  -- (r);
+\end{tikzpicture}
+\vspace{-2pt}
+\caption{Nexus end-to-end spatiotemporal RAG pipeline.}
+\label{fig:arch}
+\end{figure}
+
+Fig.~\ref{fig:arch} shows the full flow. On the visual side, OpenCV samples
+a frame every two seconds exactly --- $t \in \{0.0, 2.0, 4.0, \ldots\}$ ---
+and each frame goes through a pretrained \textbf{ResNet-50} backbone. The
+2048-dim penultimate features get projected down to $\mathbb{R}^{512}$, and
+a lightweight classification head simultaneously guesses one of five visual
+categories: \textit{architecture diagram}, \textit{code snippet},
+\textit{slide}, \textit{whiteboard}, or \textit{talking-head} (CLO04).
+
+The audio side is a bit more involved. FFmpeg strips the audio track to
+16\,kHz mono, \textbf{Whisper} (\texttt{base} model) transcribes it into
+timestamped segments, and \texttt{all-MiniLM-L6-v2} embeds each segment's
+text into 512 dimensions. Those embeddings then run sequentially through
+a bidirectional \textbf{PyTorch GRU} with hidden dimension 256 --- because
+without some sequential modelling, the representation for ``as we mentioned
+earlier'' has no idea what was mentioned earlier (CLO05):
+\begin{equation}
+h_t = \text{GRU}(x_t,\, h_{t-1}).
+\end{equation}
+
+% ── 3. Core Technical Contributions ──────────────────────────────────────────
+\section{Core Technical Contributions}
+
+\subsection{Two-Second Temporal Window Alignment}
+
+Here is the practical problem: a Whisper segment might run from $t=1.3$\,s
+to $t=5.1$\,s, but our frame grid runs on clean two-second boundaries.
+We define windows $W_k = [2k,\, 2k{+}2)$ and assign speech to windows
+proportionally by overlap:
+\begin{equation}
+  \text{Overlap}(W_k, S_j)=\max\!\bigl(0,\,
+  \min(t_{k,e},\,t_e^j)-\max(t_{k,s},\,t_s^j)\bigr).
+\end{equation}
+Each window's audio vector is then a weighted average of all overlapping
+segment embeddings. It is not a particularly glamorous component, but
+getting this wrong corrupts every downstream fusion result --- so we
+wrote dedicated unit tests for it.
+
+\subsection{Pure NumPy Cross-Modal Attention (CLO01/CLO02)}
+
+The fusion itself is a single-head scaled dot-product attention where
+the GRU-encoded audio acts as the query and the ResNet visual features
+supply the keys and values. Everything is in NumPy:
+\begin{align}
+  Q &= A W_Q,\quad K = V W_K,\quad V_l = V W_V \\
+  S &= \tfrac{QK^\top}{\sqrt{d_k}},\quad
+  \alpha = \tfrac{\exp(S-\max S)}{\textstyle\sum_j \exp(S_j-\max S)} \\
+  Z &= \alpha V_l + A,\quad
+  \hat{Z} = \tfrac{Z-\mu}{\sqrt{\sigma^2+\varepsilon}}\odot\gamma+\beta.
+\end{align}
+
+Weight matrices $W_Q, W_K, W_V \in \mathbb{R}^{512\times 512}$ use Xavier
+uniform initialisation \cite{glorot2010init}. The residual addition $Z = \alpha V_l + A$
+matters --- without it, the audio signal gets washed out entirely when
+visual attention weights are dominant. Temporal position is injected via
+sinusoidal encodings before fusion:
+\begin{equation}
+  \text{PE}(t,2i)=\sin\!\Bigl(\tfrac{t}{10000^{2i/d}}\Bigr),\quad
+  \text{PE}(t,2i{+}1)=\cos\!\Bigl(\tfrac{t}{10000^{2i/d}}\Bigr).
+\end{equation}
+The fused vector is $\ell_2$-normalised to unit length before writing to
+ChromaDB.
+
+\subsection{Retrieval and Answer Synthesis}
+
+Query embeddings use the same SentenceTransformer. ChromaDB returns the
+top-$k$ results by cosine distance; anything below $\tau_{\min}=0.12$
+similarity is discarded --- the system says ``nothing relevant found''
+rather than confabulating an answer. Retrieved windows within six seconds
+of each other get merged into a single \texttt{TopicSegment}, duplicate
+sentences across adjacent windows are deduplicated, and the result is
+formatted with a prominently displayed timestamp anchor.
+
+% ── 4. Implementation ────────────────────────────────────────────────────────
+\section{Implementation}
+
+\begin{table}[ht]
+\centering
+\caption{Technology stack}
+\label{tab:stack}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Layer} & \textbf{Technology} & \textbf{Role} \\ \midrule
+Backend API        & FastAPI (Python 3.11)  & Async REST + pipeline jobs \\
+Speech-to-Text     & Whisper \texttt{base}  & Timestamped segments \\
+Visual Encoder     & ResNet-50 (pretrained) & Frame features + scene label \\
+Sequential Context & PyTorch GRU            & Discourse-aware audio vectors \\
+Attention          & Pure NumPy             & Cross-modal fusion \\
+Vector DB          & ChromaDB (persistent)  & 512-dim cosine retrieval \\
+Text Embeddings    & all-MiniLM-L6-v2       & Query + transcript embed \\
+Relational DB      & PostgreSQL + asyncpg   & Video, job, status metadata \\
+Frontend           & React 19 + Vite + TS   & Upload, pipeline UI, query \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:stack} gives the full stack. The backend spans 15 Python
+modules; the frontend has components for drag-and-drop upload, a live
+eight-stage pipeline progress tracker, a query bar with preset chips, and
+multimodal result cards that show the frame thumbnail alongside the
+synthesised answer and a click-to-seek timestamp.
+
+One design detail worth mentioning: Whisper intentionally runs on CPU
+even on MPS-equipped Apple Silicon machines, because fp16 inference on
+Apple's Neural Engine produces unreliable results with the current
+\texttt{openai-whisper} release.
+
+% ── 5. Evaluation ────────────────────────────────────────────────────────────
+\section{Evaluation}
+
+Retrieval quality is measured with Recall@$k$ ($k \in \{1,3,5\}$) using a
+$\tau=3$\,s timestamp tolerance, and with MRR:
+$\text{MRR}=\frac{1}{|Q|}\sum_q \frac{1}{\text{rank}_q}$.
+Visual classification uses Top-1 accuracy and Macro-F1 across the five
+educational scene categories.
+
+\begin{table}[ht]
+\centering
+\caption{Mathematical unit test coverage (\texttt{pytest})}
+\label{tab:tests}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Test} & \textbf{Property Verified} \\ \midrule
+Softmax stability     & $\sum_j\alpha_j=1$; safe with $S_i\in[-500,1000]$ \\
+LayerNorm             & $\mu\approx 0$, $\sigma^2\approx 1$ along feature axis \\
+Single-head attention & Output shape; single-item $\alpha=1.0$ \\
+Masked attention      & Masked weight $<10^{-6}$; unmasked $\approx 1.0$ \\
+Temporal PE           & $\text{PE}\in[-1,1]$, shape $(T,d)$ correct \\
+End-to-end fusion     & $\|\hat{Z}\|_2=1.0$ \\
+Window alignment      & Overlap arithmetic, boundary edge cases \\
+ChromaDB retrieval    & Insert, search, Recall@k pipeline \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every mathematical claim in Section~III has a corresponding test in
+Table~\ref{tab:tests}. That said, formal benchmark evaluation against a
+labelled query set is still in progress --- the evaluation module in
+\texttt{backend/evaluation/metrics.py} returns an explicit
+\textit{``Evaluation dataset not yet provided''} status rather than
+inventing numbers.
+
+% ── 6. Results & Discussion ───────────────────────────────────────────────────
+\section{Results \& Discussion}
+
+At the time of writing, both servers are running: FastAPI at
+\texttt{localhost:8000} and the Vite frontend at \texttt{localhost:5173}.
+ChromaDB holds 284 indexed spatiotemporal chunks from ingested test footage,
+and qualitative tests show that the similarity gate ($\tau_{\min}=0.12$)
+correctly rejects off-topic queries without returning garbage results.
+
+We deliberately chose NumPy over a PyTorch \texttt{nn.Module} for the
+attention layer. Yes, it is slower and slightly more painful to write, but
+it means every intermediate value --- the raw score matrix, the softmax
+weights, the residual sum --- is a plain numpy array you can inspect in a
+debugger or test against an analytical expectation. That transparency was
+more valuable for this project than the speed gain.
+
+\noindent\textbf{Known limitations.} PostgreSQL connectivity requires the
+\texttt{greenlet} package (the system falls back to an in-memory store
+without it). The ResNet classifier is tuned for educational content and
+likely won't generalise well elsewhere without fine-tuning.
+
+\noindent\textbf{Planned next steps.} A multi-head attention variant
+is already stubbed in \texttt{numpy\_attention.py} as optional future
+work. We also plan to benchmark against a labelled query set and explore
+speaker diarisation for multi-participant recordings.
+
+% ── 7. Conclusion ─────────────────────────────────────────────────────────────
+\section{Conclusion}
+Nexus is a working multimodal RAG system that treats educational video as
+a first-class retrieval target. The combination of Whisper, ResNet-50, a
+bidirectional GRU, and a hand-rolled NumPy attention layer produces
+512-dimensional embeddings that support meaningful semantic search over
+lecture content. The groundwork --- pipeline, vector store, evaluation
+harness, unit tests --- is in place; quantitative benchmarking is the
+obvious next step.
+
+% ── References ────────────────────────────────────────────────────────────────
+\begin{thebibliography}{00}
+\bibitem{lewis2020rag} P.~Lewis et al., ``Retrieval-augmented generation for knowledge-intensive NLP tasks,'' \textit{NeurIPS}, vol.~33, pp.~9459--9474, 2020.
+\bibitem{vaswani2017attention} A.~Vaswani et al., ``Attention is all you need,'' \textit{NeurIPS}, vol.~30, 2017.
+\bibitem{radford2023whisper} A.~Radford et al., ``Robust speech recognition via large-scale weak supervision,'' \textit{ICML}, pp.~28492--28518, 2023.
+\bibitem{he2016resnet} K.~He et al., ``Deep residual learning for image recognition,'' \textit{CVPR}, pp.~770--778, 2016.
+\bibitem{cho2014gru} K.~Cho et al., ``Learning phrase representations using RNN encoder-decoder,'' \textit{EMNLP}, pp.~1724--1734, 2014.
+\bibitem{glorot2010init} X.~Glorot and Y.~Bengio, ``Understanding the difficulty of training deep feedforward neural networks,'' \textit{AISTATS}, pp.~249--256, 2010.
+\end{thebibliography}
+
+\end{document}
